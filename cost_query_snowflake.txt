@@ -1,0 +1,184 @@
+Here are a few copy/paste Snowflake SQL patterns that will give you daily spend across warehouses, while excluding Document AI (both the Snowsight “Document AI” feature and the Cortex document-processing functions like PARSE_DOCUMENT, AI_EXTRACT, <model_build_name>!PREDICT).  ￼
+
+⸻
+
+1) Daily warehouse compute credits (incl. idle) excluding Document AI
+
+This gives you a clean per-warehouse daily view showing:
+	•	total compute credits (includes idle),
+	•	idle compute credits,
+	•	Document AI query execution credits,
+	•	“non-Document-AI” query execution credits,
+	•	and “non-Document-AI compute including idle”.
+
+-- Tip: if you plan to reconcile with ORG views later, consider UTC:
+-- ALTER SESSION SET TIMEZONE = 'UTC';
+
+WITH params AS (
+  SELECT DATEADD('day', -30, CURRENT_TIMESTAMP()) AS start_ts
+),
+
+-- All query IDs that are "Document AI"
+doc_ai_query_ids AS (
+  SELECT DISTINCT query_id
+  FROM SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+
+  UNION
+
+  SELECT DISTINCT query_id
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+),
+
+-- Compute credits attributed to Document AI queries (execution only; no idle)
+doc_ai_attributed AS (
+  SELECT
+    DATE_TRUNC('day', qah.start_time) AS usage_day,
+    qah.warehouse_name,
+    SUM(COALESCE(qah.credits_attributed_compute, 0)) AS docai_query_exec_credits,
+    SUM(COALESCE(qah.credits_used_query_acceleration, 0)) AS docai_qas_credits
+  FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY qah
+  WHERE qah.start_time >= (SELECT start_ts FROM params)
+    AND (
+      qah.query_id IN (SELECT query_id FROM doc_ai_query_ids)
+      OR COALESCE(qah.root_query_id, qah.query_id) IN (SELECT query_id FROM doc_ai_query_ids)
+    )
+  GROUP BY 1, 2
+),
+
+-- Warehouse daily totals
+wh_daily AS (
+  SELECT
+    DATE_TRUNC('day', start_time) AS usage_day,
+    warehouse_name,
+    SUM(credits_used_compute) AS total_compute_credits,
+    SUM(credits_used_cloud_services) AS total_cloud_services_credits,
+    SUM(credits_used) AS total_credits,
+    SUM(credits_attributed_compute_queries) AS total_attributed_query_credits
+  FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+  GROUP BY 1, 2
+)
+
+SELECT
+  w.usage_day,
+  w.warehouse_name,
+
+  -- Totals
+  w.total_compute_credits,
+  w.total_attributed_query_credits,
+  (w.total_compute_credits - w.total_attributed_query_credits) AS idle_compute_credits,
+
+  -- Doc AI subset (execution only)
+  COALESCE(d.docai_query_exec_credits, 0) AS docai_query_exec_credits,
+
+  -- What you asked for: "non Document AI" across warehouses
+  (w.total_attributed_query_credits - COALESCE(d.docai_query_exec_credits, 0)) AS non_docai_query_exec_credits,
+  (w.total_compute_credits - COALESCE(d.docai_query_exec_credits, 0)) AS non_docai_compute_including_idle_credits,
+
+  -- Useful context
+  w.total_cloud_services_credits,
+  COALESCE(d.docai_qas_credits, 0) AS docai_qas_credits
+
+FROM wh_daily w
+LEFT JOIN doc_ai_attributed d
+  ON w.usage_day = d.usage_day
+ AND w.warehouse_name = d.warehouse_name
+ORDER BY 1, 2;
+
+Why this works:
+	•	WAREHOUSE_METERING_HISTORY gives hourly credits used (compute + cloud services) plus credits attributed to queries (so you can compute idle).  ￼
+	•	QUERY_ATTRIBUTION_HISTORY gives per-query compute credits (execution only, not idle), which makes “exclude Document AI queries” feasible.  ￼
+	•	Both Document AI views provide the query IDs to exclude.  ￼
+
+Notes:
+	•	Warehouse metering credits don’t include the daily cloud-services billing adjustment; billed compute is best reconciled via METERING_DAILY_HISTORY (account-level).  ￼
+	•	Latency: warehouse metering can lag hours; query attribution can lag up to ~8 hours.  ￼
+
+⸻
+
+2) Daily AI token credits (Cortex AI Functions) by warehouse excluding Document AI
+
+If by “expenditure on non Document AI processes” you meant AI-services credits (token-based), this uses CORTEX_AISQL_USAGE_HISTORY and removes any query IDs that were document processing. TOKEN_CREDITS explicitly excludes warehouse credits.  ￼
+
+WITH params AS (
+  SELECT DATEADD('day', -30, CURRENT_TIMESTAMP()) AS start_ts
+),
+
+doc_ai_query_ids AS (
+  SELECT DISTINCT query_id
+  FROM SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+
+  UNION
+
+  SELECT DISTINCT query_id
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+),
+
+wh_map AS (
+  SELECT DISTINCT warehouse_id::TEXT AS warehouse_id, warehouse_name
+  FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+    AND warehouse_id IS NOT NULL
+    AND warehouse_name IS NOT NULL
+),
+
+aisql_non_doc AS (
+  SELECT
+    DATE_TRUNC('day', usage_time) AS usage_day,
+    warehouse_id,
+    SUM(token_credits) AS ai_token_credits,
+    SUM(tokens) AS tokens
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY
+  WHERE usage_time >= (SELECT start_ts FROM params)
+    AND query_id NOT IN (SELECT query_id FROM doc_ai_query_ids)
+  GROUP BY 1, 2
+)
+
+SELECT
+  a.usage_day,
+  m.warehouse_name,
+  a.ai_token_credits,
+  a.tokens
+FROM aisql_non_doc a
+LEFT JOIN wh_map m
+  ON a.warehouse_id::TEXT = m.warehouse_id
+ORDER BY 1, 2;
+
+Important gotcha: CORTEX_AISQL_USAGE_HISTORY only includes usage on/after Nov 17, 2025.  ￼
+
+⸻
+
+3) Convert credits → currency (if you have ORG usage access)
+
+If you can query SNOWFLAKE.ORGANIZATION_USAGE.USAGE_IN_CURRENCY_DAILY, you can compute an effective $/credit for WAREHOUSE_METERING and multiply your per-warehouse credits by it. (This view reports usage date in UTC and can lag up to 72 hours.)  ￼
+
+WITH price_per_credit AS (
+  SELECT
+    usage_date,
+    account_locator,
+    SUM(CASE WHEN rating_type='compute'
+              AND service_type='WAREHOUSE_METERING'
+              AND NOT is_adjustment
+             THEN usage_in_currency END)
+    /
+    NULLIF(SUM(CASE WHEN rating_type='compute'
+                     AND service_type='WAREHOUSE_METERING'
+                     AND NOT is_adjustment
+                    THEN usage END), 0) AS currency_per_credit,
+    MAX(currency) AS currency
+  FROM SNOWFLAKE.ORGANIZATION_USAGE.USAGE_IN_CURRENCY_DAILY
+  WHERE usage_date >= DATEADD('day', -30, CURRENT_DATE())
+    AND account_locator = CURRENT_ACCOUNT()
+  GROUP BY 1, 2
+)
+SELECT * FROM price_per_credit ORDER BY usage_date;
+
+Then join price_per_credit onto the daily warehouse output from query #1 on date.
+
+⸻
+
+If you tell me which “expenditure” you care about most (warehouse credits, AI token credits, or true billed $), I’ll collapse this into one final query that outputs exactly the daily columns you want.
