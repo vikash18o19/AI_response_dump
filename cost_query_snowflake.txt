@@ -182,3 +182,106 @@ Then join price_per_credit onto the daily warehouse output from query #1 on date
 ⸻
 
 If you tell me which “expenditure” you care about most (warehouse credits, AI token credits, or true billed $), I’ll collapse this into one final query that outputs exactly the daily columns you want.
+
+
+
+
+
+
+-- Change window as needed
+WITH params AS (
+  SELECT DATEADD('day', -30, CURRENT_TIMESTAMP()) AS start_ts
+),
+
+/* 1) Document AI jobs (Snowsight Document AI / job-style usage) */
+docai_jobs AS (
+  SELECT
+    DATE_TRUNC('day', start_time) AS usage_day,
+    query_id,
+    operation_name,
+    SUM(credits_used) AS docai_job_credits,
+    SUM(page_count)   AS pages,
+    SUM(document_count) AS documents,
+    SUM(feature_count)  AS features
+  FROM SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+  GROUP BY 1,2,3
+),
+
+/* 2) Cortex Document Processing functions (PARSE_DOCUMENT / AI_EXTRACT / <model_build>!PREDICT, etc.) */
+docai_funcs AS (
+  SELECT
+    DATE_TRUNC('day', start_time) AS usage_day,
+    query_id,
+    function_name,
+    model_name,
+    operation_name,
+    SUM(credits_used) AS docai_func_credits,
+    SUM(page_count)   AS pages,
+    SUM(document_count) AS documents,
+    SUM(feature_count)  AS features
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+  GROUP BY 1,2,3,4,5
+),
+
+/* Set of query_ids that correspond to Document AI activity */
+docai_query_ids AS (
+  SELECT DISTINCT query_id FROM docai_jobs
+  UNION
+  SELECT DISTINCT query_id FROM docai_funcs
+),
+
+/* Warehouse/user attribution for those queries (execution credits only; no idle) */
+wh_exec AS (
+  SELECT
+    DATE_TRUNC('day', start_time) AS usage_day,
+    warehouse_name,
+    user_name,
+    SUM(COALESCE(credits_attributed_compute, 0)) AS wh_exec_credits,
+    SUM(COALESCE(credits_used_query_acceleration, 0)) AS qas_credits
+  FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+    AND (
+      query_id IN (SELECT query_id FROM docai_query_ids)
+      OR COALESCE(root_query_id, query_id) IN (SELECT query_id FROM docai_query_ids)
+    )
+  GROUP BY 1,2,3
+),
+
+/* Attach warehouse/user to AI credits via attribution (best-effort) */
+ai_credits_by_wh AS (
+  SELECT
+    e.usage_day,
+    e.warehouse_name,
+    e.user_name,
+    COALESCE(SUM(j.docai_job_credits), 0) AS docai_job_credits,
+    COALESCE(SUM(f.docai_func_credits), 0) AS docai_func_credits
+  FROM wh_exec e
+  LEFT JOIN docai_jobs  j ON e.usage_day = j.usage_day AND e.user_name IS NOT NULL AND j.query_id IS NOT NULL AND j.query_id IN (SELECT query_id FROM docai_query_ids)
+  LEFT JOIN docai_funcs f ON e.usage_day = f.usage_day AND e.user_name IS NOT NULL AND f.query_id IS NOT NULL AND f.query_id IN (SELECT query_id FROM docai_query_ids)
+  GROUP BY 1,2,3
+)
+
+SELECT
+  e.usage_day,
+  e.warehouse_name,
+  e.user_name,
+
+  -- AI service credits (Document AI)
+  COALESCE(a.docai_job_credits, 0)  AS docai_job_credits,   -- from DOCUMENT_AI_USAGE_HISTORY
+  COALESCE(a.docai_func_credits, 0) AS docai_func_credits,  -- from CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY
+  (COALESCE(a.docai_job_credits, 0) + COALESCE(a.docai_func_credits, 0)) AS docai_ai_service_credits,
+
+  -- Warehouse compute used to run the SQL queries that triggered Document AI (execution only)
+  e.wh_exec_credits,
+  e.qas_credits,
+
+  (COALESCE(a.docai_job_credits, 0) + COALESCE(a.docai_func_credits, 0) + e.wh_exec_credits + e.qas_credits) AS docai_total_credits_est
+
+FROM wh_exec e
+LEFT JOIN ai_credits_by_wh a
+  ON e.usage_day = a.usage_day
+ AND e.warehouse_name = a.warehouse_name
+ AND e.user_name = a.user_name
+ORDER BY 1,2,3;
