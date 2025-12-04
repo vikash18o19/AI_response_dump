@@ -285,3 +285,233 @@ LEFT JOIN ai_credits_by_wh a
  AND e.warehouse_name = a.warehouse_name
  AND e.user_name = a.user_name
 ORDER BY 1,2,3;
+
+
+
+
+
+
+
+
+
+-- ============
+-- PARAMETERS
+-- ============
+ALTER SESSION SET TIMEZONE = 'UTC';
+
+SET START_DATE = '2025-11-17'::DATE;
+SET END_DATE   = '2025-12-03'::DATE;
+
+-- Your conversion:
+SET USD_PER_CREDIT = 3;
+
+-- Optional if you want a rough storage $ estimate (Snowflake storage is usually $/TB-month, not credits).
+-- Leave NULL if unknown.
+SET STORAGE_USD_PER_TB_MONTH = NULL;  -- e.g. 40
+
+WITH params AS (
+  SELECT
+    $START_DATE::DATE AS start_date,
+    $END_DATE::DATE   AS end_date,
+    TO_TIMESTAMP_LTZ($START_DATE::DATE) AS start_ts,
+    TO_TIMESTAMP_LTZ(DATEADD('day', 1, $END_DATE::DATE)) AS end_ts,
+    $USD_PER_CREDIT::NUMBER(38,9) AS usd_per_credit,
+    $STORAGE_USD_PER_TB_MONTH::NUMBER(38,9) AS storage_usd_per_tb_month
+),
+
+-- Map warehouse_id -> warehouse_name for the window (for AISQL view which provides WAREHOUSE_ID)
+wh_map AS (
+  SELECT DISTINCT
+    warehouse_id::TEXT AS warehouse_id,
+    warehouse_name
+  FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+    AND start_time <  (SELECT end_ts   FROM params)
+    AND warehouse_id IS NOT NULL
+    AND warehouse_name IS NOT NULL
+),
+
+-- -------------------------
+-- Document AI credits (serverless)
+-- -------------------------
+doc_ai AS (
+  SELECT
+    COALESCE(q.warehouse_name, 'UNKNOWN') AS warehouse_name,
+    SUM(d.credits_used) AS doc_ai_job_credits
+  FROM SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY d
+  LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY q
+    ON d.query_id = q.query_id
+   AND q.start_time >= (SELECT start_ts FROM params)
+   AND q.start_time <  (SELECT end_ts   FROM params)
+  WHERE d.start_time >= (SELECT start_ts FROM params)
+    AND d.start_time <  (SELECT end_ts   FROM params)
+  GROUP BY 1
+),
+doc_proc AS (
+  SELECT
+    COALESCE(q.warehouse_name, 'UNKNOWN') AS warehouse_name,
+    SUM(p.credits_used) AS doc_processing_func_credits
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY p
+  LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY q
+    ON p.query_id = q.query_id
+   AND q.start_time >= (SELECT start_ts FROM params)
+   AND q.start_time <  (SELECT end_ts   FROM params)
+  WHERE p.start_time >= (SELECT start_ts FROM params)
+    AND p.start_time <  (SELECT end_ts   FROM params)
+  GROUP BY 1
+),
+doc_ai_by_wh AS (
+  SELECT
+    COALESCE(a.warehouse_name, b.warehouse_name) AS warehouse_name,
+    COALESCE(a.doc_ai_job_credits, 0) + COALESCE(b.doc_processing_func_credits, 0) AS doc_ai_total_credits
+  FROM doc_ai a
+  FULL OUTER JOIN doc_proc b
+    ON a.warehouse_name = b.warehouse_name
+),
+
+-- -------------------------
+-- Cortex AI COMPLETE credits (token credits; not warehouse compute)
+-- -------------------------
+cortex_complete_by_wh AS (
+  SELECT
+    COALESCE(m.warehouse_name, 'UNKNOWN') AS warehouse_name,
+    SUM(u.token_credits) AS cortex_complete_credits
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY u
+  LEFT JOIN wh_map m
+    ON u.warehouse_id = m.warehouse_id
+  WHERE u.usage_time >= (SELECT start_ts FROM params)
+    AND u.usage_time <  (SELECT end_ts   FROM params)
+    AND UPPER(u.function_name) = 'COMPLETE'
+  GROUP BY 1
+),
+
+-- -------------------------
+-- Build set of "AI-involved" query_ids (any Cortex AI function + any DocAI/Doc processing)
+-- Used to exclude those queries from "non-AI SQL compute" bucket
+-- -------------------------
+ai_query_ids AS (
+  SELECT DISTINCT query_id
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AISQL_USAGE_HISTORY
+  WHERE usage_time >= (SELECT start_ts FROM params)
+    AND usage_time <  (SELECT end_ts   FROM params)
+
+  UNION
+
+  SELECT DISTINCT query_id
+  FROM SNOWFLAKE.ACCOUNT_USAGE.DOCUMENT_AI_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+    AND start_time <  (SELECT end_ts   FROM params)
+
+  UNION
+
+  SELECT DISTINCT query_id
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_DOCUMENT_PROCESSING_USAGE_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+    AND start_time <  (SELECT end_ts   FROM params)
+),
+
+-- -------------------------
+-- Non-AI SQL query compute (execution only) excluding AI/DocAI query_ids (and their root)
+-- -------------------------
+non_ai_sql_by_wh AS (
+  SELECT
+    warehouse_name,
+    SUM(COALESCE(credits_attributed_compute, 0)) AS non_ai_query_exec_credits,
+    SUM(COALESCE(credits_used_query_acceleration, 0)) AS non_ai_qas_credits
+  FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY
+  WHERE start_time >= (SELECT start_ts FROM params)
+    AND start_time <  (SELECT end_ts   FROM params)
+    AND warehouse_name IS NOT NULL
+    AND COALESCE(root_query_id, query_id) NOT IN (SELECT query_id FROM ai_query_ids)
+    AND query_id NOT IN (SELECT query_id FROM ai_query_ids)
+  GROUP BY 1
+),
+
+-- -------------------------
+-- Account storage (not per warehouse)
+-- -------------------------
+acct_storage AS (
+  SELECT
+    AVG(
+      COALESCE(storage_bytes,0)
+    + COALESCE(stage_bytes,0)
+    + COALESCE(failsafe_bytes,0)
+    + COALESCE(hybrid_table_storage_bytes,0)
+    ) AS avg_daily_total_bytes
+  FROM SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE
+  WHERE usage_date >= (SELECT start_date FROM params)
+    AND usage_date <= (SELECT end_date   FROM params)
+),
+
+-- Union of warehouses appearing in any bucket
+all_wh AS (
+  SELECT warehouse_name FROM doc_ai_by_wh
+  UNION
+  SELECT warehouse_name FROM cortex_complete_by_wh
+  UNION
+  SELECT warehouse_name FROM non_ai_sql_by_wh
+)
+
+-- ============
+-- FINAL OUTPUT
+-- ============
+SELECT
+  'WAREHOUSE' AS row_type,
+  w.warehouse_name,
+
+  -- Credits
+  COALESCE(c.cortex_complete_credits, 0) AS cortex_complete_credits,
+  COALESCE(d.doc_ai_total_credits, 0)    AS document_ai_processing_credits,
+  (COALESCE(n.non_ai_query_exec_credits, 0) + COALESCE(n.non_ai_qas_credits, 0)) AS non_ai_sql_compute_credits,
+
+  -- USD (using your $/credit)
+  COALESCE(c.cortex_complete_credits, 0) * (SELECT usd_per_credit FROM params) AS cortex_complete_usd,
+  COALESCE(d.doc_ai_total_credits, 0)    * (SELECT usd_per_credit FROM params) AS document_ai_processing_usd,
+  (COALESCE(n.non_ai_query_exec_credits, 0) + COALESCE(n.non_ai_qas_credits, 0))
+    * (SELECT usd_per_credit FROM params) AS non_ai_sql_compute_usd,
+
+  -- Totals
+  (
+    COALESCE(c.cortex_complete_credits, 0)
+  + COALESCE(d.doc_ai_total_credits, 0)
+  + COALESCE(n.non_ai_query_exec_credits, 0)
+  + COALESCE(n.non_ai_qas_credits, 0)
+  ) AS total_credits_est,
+  (
+    COALESCE(c.cortex_complete_credits, 0)
+  + COALESCE(d.doc_ai_total_credits, 0)
+  + COALESCE(n.non_ai_query_exec_credits, 0)
+  + COALESCE(n.non_ai_qas_credits, 0)
+  ) * (SELECT usd_per_credit FROM params) AS total_usd_est,
+
+  -- Storage fields (not warehouse attributable)
+  NULL::NUMBER AS avg_daily_storage_bytes,
+  NULL::NUMBER AS approx_storage_usd_for_range
+
+FROM all_wh w
+LEFT JOIN cortex_complete_by_wh c ON w.warehouse_name = c.warehouse_name
+LEFT JOIN doc_ai_by_wh d          ON w.warehouse_name = d.warehouse_name
+LEFT JOIN non_ai_sql_by_wh n      ON w.warehouse_name = n.warehouse_name
+
+UNION ALL
+
+SELECT
+  'ACCOUNT_STORAGE' AS row_type,
+  '__ACCOUNT__' AS warehouse_name,
+  NULL, NULL, NULL,
+  NULL, NULL, NULL,
+  NULL, NULL,
+  s.avg_daily_total_bytes AS avg_daily_storage_bytes,
+  /* Optional rough estimate:
+     avg_daily_TB * $/TB-month * (#days / 30.4375)
+  */
+  CASE
+    WHEN (SELECT storage_usd_per_tb_month FROM params) IS NULL THEN NULL
+    ELSE
+      (s.avg_daily_total_bytes / POW(1024, 4))
+      * (SELECT storage_usd_per_tb_month FROM params)
+      * (DATEDIFF('day', (SELECT start_date FROM params), DATEADD('day',1,(SELECT end_date FROM params))) / 30.4375)
+  END AS approx_storage_usd_for_range
+FROM acct_storage s
+
+ORDER BY row_type, warehouse_name;
